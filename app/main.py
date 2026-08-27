@@ -130,24 +130,3 @@ async def analyze_audio(
         processing_ms=int((time.time() - start_time) * 1000),
         audio_quality=results["quality"]
     )
-    start_time = time.time()
-    
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
-
-    try:
-        results = pipeline.predict(tmp_path)
-    except Exception as e:
-        logger.error(f"Processing error: {e}")
-        raise HTTPException(status_code=400, detail="Invalid audio file")
-    finally:
-        os.remove(tmp_path) 
-    
-    return AnalysisResponse(
-        contact_id=contact_id,
-        gender=Prediction(prediction=results["gender"], confidence=results["g_conf"]),
-        age_bracket=Prediction(prediction=results["age"], confidence=results["a_conf"]),
-        processing_ms=int((time.time() - start_time) * 1000),
-        audio_quality=results["quality"]
-    )

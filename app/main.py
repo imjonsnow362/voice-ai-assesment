@@ -14,7 +14,6 @@ logger = logging.getLogger("voice-api")
 
 app = FastAPI(title="Logistics Voice AI API")
 
-# --- API Schemas ---
 class Prediction(BaseModel):
     prediction: str
     confidence: float
@@ -26,7 +25,6 @@ class AnalysisResponse(BaseModel):
     processing_ms: int
     audio_quality: str
 
-# --- Inference Engine ---
 class AudioPipeline:
     def __init__(self):
         logger.info("Initializing Pure-Numpy Audio Pipeline...")
@@ -43,44 +41,55 @@ class AudioPipeline:
         return "good"
 
     def predict(self, file_path: str):
-        wav_path = file_path + "_converted.wav"
+        wav_path = file_path
+        created_temp_wav = False
+
+        if not file_path.lower().endswith(".wav"):
+            wav_path = file_path + "_converted.wav"
+            try:
+                subprocess.run([
+                    "ffmpeg", "-i", file_path, 
+                    "-ac", "1", "-ar", "16000", 
+                    wav_path, "-y"
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                created_temp_wav = True
+            except Exception:
+                raise HTTPException(status_code=400, detail="Audio conversion failed. Ensure ffmpeg is installed.")
+
         try:
-            # Use ffmpeg natively to decode ANY compressed codec to 16kHz WAV
-            subprocess.run([
-                "ffmpeg", "-i", file_path, 
-                "-ac", "1", "-ar", "16000", 
-                wav_path, "-y"
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            
             sr, y = wavfile.read(wav_path)
+            if len(y.shape) > 1:
+                y = y.mean(axis=1)
             y = y.astype(np.float32) / (np.max(np.abs(y)) + 1e-10) # Normalize
         finally:
-            if os.path.exists(wav_path):
+            if created_temp_wav and os.path.exists(wav_path):
                 os.remove(wav_path)
 
         quality = self.assess_quality(y)
         if quality == "insufficient":
             return {"gender": "unknown", "g_conf": 0.0, "age": "unknown", "a_conf": 0.0, "quality": quality}
 
-        # --- 1. Pitch Extraction (Pure Math Autocorrelation) ---
-        min_period = sr // 300 # Max 300 Hz
-        max_period = sr // 50  # Min 50 Hz
+        # --- 1. OPTIMIZED Pitch Extraction (Fast Autocorrelation via FFT) ---
+        min_period = sr // 300 # Max search: 300 Hz
+        max_period = sr // 40  # Min search: lowered to 40 Hz for deep/distorted voices
         
-        corr = np.correlate(y, y, mode='full')
-        corr = corr[len(corr)//2:]
+        # FFT changes time complexity from O(N^2) to O(N log N) - massively faster!
+        n = len(y)
+        f = np.fft.fft(y, n=2 * n)
+        corr = np.fft.ifft(f * np.conjugate(f)).real
         valid_corr = corr[min_period:max_period]
         
         median_pitch = sr / (np.argmax(valid_corr) + min_period) if len(valid_corr) > 0 else 0
 
-        # Gender Heuristic
-        if 85 <= median_pitch <= 165:
+        # Gender Heuristic (Lowered floor to 50 Hz for heavy PA / Radio voices)
+        if 50 <= median_pitch <= 170:
             gender, g_conf = "male", 0.85
-        elif 165 < median_pitch <= 255:
+        elif 170 < median_pitch <= 280:
             gender, g_conf = "female", 0.82
         else:
             gender, g_conf = "unknown", 0.45
 
-        # --- 2. Spectral Centroid (Pure Math FFT) ---
+        # --- 2. Spectral Centroid (FFT) ---
         spectrum = np.abs(np.fft.rfft(y))
         freqs = np.fft.rfftfreq(len(y), 1.0/sr)
         centroid = np.sum(freqs * spectrum) / (np.sum(spectrum) + 1e-10)
@@ -93,7 +102,6 @@ class AudioPipeline:
 
 pipeline = AudioPipeline()
 
-# --- Endpoints ---
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze_audio(
     contact_id: str = Form(default_factory=lambda: str(uuid.uuid4())),
@@ -101,7 +109,7 @@ async def analyze_audio(
 ):
     start_time = time.time()
     
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".m4a") as tmp:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         tmp.write(await file.read())
         tmp_path = tmp.name
 
@@ -109,7 +117,7 @@ async def analyze_audio(
         results = pipeline.predict(tmp_path)
     except Exception as e:
         logger.error(f"Processing error: {e}")
-        raise HTTPException(status_code=400, detail="Invalid audio")
+        raise HTTPException(status_code=400, detail="Invalid audio file")
     finally:
         os.remove(tmp_path) 
     

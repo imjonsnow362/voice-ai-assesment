@@ -54,7 +54,7 @@ class AudioPipeline:
                 ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
                 created_temp_wav = True
             except Exception:
-                raise HTTPException(status_code=400, detail="Audio conversion failed. Ensure ffmpeg is installed.")
+                raise HTTPException(status_code=400, detail="Audio conversion failed.")
 
         try:
             sr, y = wavfile.read(wav_path)
@@ -69,29 +69,28 @@ class AudioPipeline:
         if quality == "insufficient":
             return {"gender": "unknown", "g_conf": 0.0, "age": "unknown", "a_conf": 0.0, "quality": quality}
 
-        # --- 1. OPTIMIZED Pitch Extraction (Fast Autocorrelation via FFT) ---
-        min_period = sr // 300 # Max search: 300 Hz
-        max_period = sr // 40  # Min search: lowered to 40 Hz for deep/distorted voices
-        
-        # FFT changes time complexity from O(N^2) to O(N log N) - massively faster!
-        n = len(y)
-        f = np.fft.fft(y, n=2 * n)
-        corr = np.fft.ifft(f * np.conjugate(f)).real
-        valid_corr = corr[min_period:max_period]
-        
-        median_pitch = sr / (np.argmax(valid_corr) + min_period) if len(valid_corr) > 0 else 0
+        # --- SINGLE FFT PASS FOR BOTH PITCH AND AGE ---
+        spectrum = np.abs(np.fft.rfft(y))
+        freqs = np.fft.rfftfreq(len(y), 1.0/sr)
 
-        # Gender Heuristic (Lowered floor to 50 Hz for heavy PA / Radio voices)
-        if 50 <= median_pitch <= 170:
+        # 1. Gender Heuristic (Spectral Peak in Human Vocal Range)
+        # Find the frequency bin with maximum energy between 50Hz and 280Hz
+        voice_band = np.where((freqs >= 50) & (freqs <= 280))[0]
+        
+        if len(voice_band) > 0:
+            dominant_pitch = freqs[voice_band[np.argmax(spectrum[voice_band])]]
+        else:
+            dominant_pitch = 0
+
+        # Gender Classification
+        if 50 <= dominant_pitch <= 165:
             gender, g_conf = "male", 0.85
-        elif 170 < median_pitch <= 280:
+        elif 165 < dominant_pitch <= 280:
             gender, g_conf = "female", 0.82
         else:
             gender, g_conf = "unknown", 0.45
 
-        # --- 2. Spectral Centroid (FFT) ---
-        spectrum = np.abs(np.fft.rfft(y))
-        freqs = np.fft.rfftfreq(len(y), 1.0/sr)
+        # 2. Age Heuristic (Spectral Centroid)
         centroid = np.sum(freqs * spectrum) / (np.sum(spectrum) + 1e-10)
 
         if centroid < 1500: age, a_conf = "46-60", 0.65

@@ -3,6 +3,9 @@ uvicorn[standard]
 python-multipart
 numpy
 scipy
+transformers
+torch
+torchaudio
 pydantic
 pytest
 httpx

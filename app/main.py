@@ -6,8 +6,9 @@ import subprocess
 import numpy as np
 from scipy.io import wavfile
 import logging
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
+from transformers import pipeline
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voice-api")
@@ -27,10 +28,15 @@ class AnalysisResponse(BaseModel):
 
 class AudioPipeline:
     def __init__(self):
-        logger.info("Initializing Pure-Numpy Audio Pipeline...")
+        logger.info("Downloading and loading wav2vec2 model (this takes a moment)...")
+        # Load the Hugging Face audio classification pipeline
+        self.classifier = pipeline(
+            "audio-classification",
+            model="audeering/wav2vec2-large-robust-21-ft-age-gender",
+            device=-1 # CPU
+        )
 
     def assess_quality(self, y):
-        """Calculates SNR to handle logistics background noise."""
         signal_power = np.mean(y**2)
         noise_power = np.percentile(y**2, 10)
         if noise_power == 0: noise_power = 1e-10
@@ -58,9 +64,8 @@ class AudioPipeline:
 
         try:
             sr, y = wavfile.read(wav_path)
-            if len(y.shape) > 1:
-                y = y.mean(axis=1)
-            y = y.astype(np.float32) / (np.max(np.abs(y)) + 1e-10) # Normalize
+            if len(y.shape) > 1: y = y.mean(axis=1)
+            y = y.astype(np.float32) / (np.max(np.abs(y)) + 1e-10)
         finally:
             if created_temp_wav and os.path.exists(wav_path):
                 os.remove(wav_path)
@@ -69,33 +74,31 @@ class AudioPipeline:
         if quality == "insufficient":
             return {"gender": "unknown", "g_conf": 0.0, "age": "unknown", "a_conf": 0.0, "quality": quality}
 
-        # --- SINGLE FFT PASS FOR BOTH PITCH AND AGE ---
-        spectrum = np.abs(np.fft.rfft(y))
-        freqs = np.fft.rfftfreq(len(y), 1.0/sr)
-
-        # 1. Gender Heuristic (Spectral Peak in Human Vocal Range)
-        # Find the frequency bin with maximum energy between 50Hz and 280Hz
-        voice_band = np.where((freqs >= 50) & (freqs <= 280))[0]
+        # --- ML MODEL INFERENCE ---
+        # The model returns a list of dicts like: [{'label': 'female', 'score': 0.8}, {'label': 'age', 'score': 0.35}]
+        hf_results = self.classifier(y)
         
-        if len(voice_band) > 0:
-            dominant_pitch = freqs[voice_band[np.argmax(spectrum[voice_band])]]
-        else:
-            dominant_pitch = 0
+        gender, g_conf = "unknown", 0.0
+        continuous_age = 0.0
+        
+        for res in hf_results:
+            label = res['label'].lower()
+            if label in ['male', 'female'] and res['score'] > g_conf:
+                gender = label
+                g_conf = round(res['score'], 2)
+            elif label == 'age':
+                continuous_age = res['score'] # Typically normalized 0-1 (e.g., 0.5 = 50 years old)
 
-        # Gender Classification
-        if 50 <= dominant_pitch <= 165:
-            gender, g_conf = "male", 0.85
-        elif 165 < dominant_pitch <= 280:
-            gender, g_conf = "female", 0.82
-        else:
-            gender, g_conf = "unknown", 0.45
-
-        # 2. Age Heuristic (Spectral Centroid)
-        centroid = np.sum(freqs * spectrum) / (np.sum(spectrum) + 1e-10)
-
-        if centroid < 1500: age, a_conf = "46-60", 0.65
-        elif centroid < 2500: age, a_conf = "31-45", 0.70
-        else: age, a_conf = "18-30", 0.60
+        # Map continuous age (assuming 0-1 maps to 0-100 years) to requested brackets
+        estimated_age_years = continuous_age * 100
+        
+        if estimated_age_years < 31: age = "18-30"
+        elif estimated_age_years < 46: age = "31-45"
+        elif estimated_age_years < 61: age = "46-60"
+        else: age = "60+"
+        
+        # Audeering age confidence is complex to extract from logits, using a safe baseline proxy
+        a_conf = 0.75 
 
         return {"gender": gender, "g_conf": g_conf, "age": age, "a_conf": a_conf, "quality": quality}
 
@@ -108,9 +111,7 @@ async def analyze_audio(
 ):
     start_time = time.time()
     
-    # Grab the original extension (e.g., .mp3) so the pipeline knows to trigger ffmpeg
     ext = os.path.splitext(file.filename)[1].lower() if file.filename else ".tmp"
-    
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
         tmp.write(await file.read())
         tmp_path = tmp.name

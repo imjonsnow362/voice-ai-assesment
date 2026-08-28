@@ -32,7 +32,7 @@ class AudioPipeline:
         # Load the Hugging Face audio classification pipeline
         self.classifier = pipeline(
             "audio-classification",
-            model="audeering/wav2vec2-large-robust-21-ft-age-gender",
+            model="audeering/wav2vec2-large-robust-24-ft-age-gender",
             device=-1 # CPU
         )
 
